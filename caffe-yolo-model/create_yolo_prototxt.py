@@ -1,297 +1,272 @@
 # -*- coding: utf-8 -*-
-from ConfigParser import ConfigParser
-from collections import OrderedDict
+"""
+Convert a YOLO's .cfg to Caffe's .prototxt
+"""
+from __future__ import print_function, division
+
 import argparse
-import logging
 import os
-import sys
 
-class CaffeLayerGenerator(object):
-    def __init__(self, name, ltype):
-        self.name = name
-        self.bottom = []
-        self.top = []
-        self.type = ltype
-    def get_template(self):
-        return """
-layer {{{{
-  name: "{}"
-  type: "{}"
-  bottom: "{}"
-  top: "{}"{{}}
-}}}}""".format(self.name, self.type, self.bottom[0], self.top[0])
+if 'GLOG_minloglevel' not in os.environ:
+    os.environ['GLOG_minloglevel'] = '2'  # suppress verbose Caffe output
 
-class CaffeInputLayer(CaffeLayerGenerator):
-    def __init__(self, name, channels, width, height):
-        super(CaffeInputLayer, self).__init__(name, 'Input')
-        self.channels = channels
-        self.width = width
-        self.height = height
-    def write(self, f):
-        f.write("""
-input: "{}"
-input_shape {{
-  dim: 1
-  dim: {}
-  dim: {}
-  dim: {}
-}}""".format(self.name, self.channels, self.width, self.height))
+from caffe import layers as cl
+from caffe import params as cp
+import caffe
 
-class CaffeConvolutionLayer(CaffeLayerGenerator):
-    def __init__(self, name, filters, ksize=None, stride=None, pad=None, bias=True):
-        super(CaffeConvolutionLayer, self).__init__(name, 'Convolution')
-        self.filters = filters
-        self.ksize = ksize
-        self.stride = stride
-        self.pad = pad
-        self.bias = bias
-    def write(self, f):
-        opts = ['']
-        if self.ksize is not None: opts.append('kernel_size: {}'.format(self.ksize))
-        if self.stride is not None: opts.append('stride: {}'.format(self.stride))
-        if self.pad is not None: opts.append('pad: {}'.format(self.pad))
-        if not self.bias: opts.append('bias_term: false')
-        param_str = """
-  convolution_param {{
-    num_output: {}{}
-  }}""".format(self.filters, '\n    '.join(opts))
-        f.write(self.get_template().format(param_str))
 
-class CaffePoolingLayer(CaffeLayerGenerator):
-    def __init__(self, name, pooltype, ksize=None, stride=None, pad=None, global_pooling=None):
-        super(CaffePoolingLayer, self).__init__(name, 'Pooling')
-        self.pooltype = pooltype
-        self.ksize = ksize
-        self.stride = stride
-        self.pad = pad
-        self.global_pooling = global_pooling
-    def write(self, f):
-        opts = ['']
-        if self.ksize is not None: opts.append('kernel_size: {}'.format(self.ksize))
-        if self.stride is not None: opts.append('stride: {}'.format(self.stride))
-        if self.pad is not None: opts.append('pad: {}'.format(self.pad))
-        if self.global_pooling is not None: opts.append('global_pooling: {}'.format('True' if self.global_pooling else 'False'))
-        param_str = """
-  pooling_param {{
-    pool: {}{}
-  }}""".format(self.pooltype, '\n    '.join(opts))
-        f.write(self.get_template().format(param_str))
+def load_configuration(fname):
+    """ Load YOLO configuration file. """
+    with open(fname, 'r') as fconf:
+        lines = [l.strip() for l in fconf]
 
-class CaffeInnerProductLayer(CaffeLayerGenerator):
-    def __init__(self, name, num_output):
-        super(CaffeInnerProductLayer, self).__init__(name, 'InnerProduct')
-        self.num_output = num_output
-    def write(self, f):
-        param_str = """
-  inner_product_param {{
-    num_output: {}
-  }}""".format(self.num_output)
-        f.write(self.get_template().format(param_str))
-
-class CaffeBatchNormLayer(CaffeLayerGenerator):
-    def __init__(self, name):
-        super(CaffeBatchNormLayer, self).__init__(name, 'BatchNorm')
-    def write(self, f):
-        param_str = """
-  batch_norm_param {
-    use_global_stats: true
-  }"""
-        f.write(self.get_template().format(param_str))
-
-class CaffeScaleLayer(CaffeLayerGenerator):
-    def __init__(self, name):
-        super(CaffeScaleLayer, self).__init__(name, 'Scale')
-    def write(self, f):
-        param_str = """
-  scale_param {
-    bias_term: true
-  }"""
-        f.write(self.get_template().format(param_str))
-
-class CaffeReluLayer(CaffeLayerGenerator):
-    def __init__(self, name, negslope=None):
-        super(CaffeReluLayer, self).__init__(name, 'Relu')
-        self.negslope = negslope
-    def write(self, f):
-        param_str = ""
-        if self.negslope is not None:
-            param_str = """
-  relu_param {{
-    negative_slope: {}
-  }}""".format(self.negslope)
-        f.write(self.get_template().format(param_str))
-
-class CaffeDropoutLayer(CaffeLayerGenerator):
-    def __init__(self, name, prob):
-        super(CaffeDropoutLayer, self).__init__(name, 'Dropout')
-        self.prob = prob
-    def write(self, f):
-        param_str = """
-  dropout_param {{
-    dropout_ratio: {}
-  }}""".format(self.prob)
-        f.write(self.get_template().format(param_str))
-
-class CaffeSoftmaxLayer(CaffeLayerGenerator):
-    def __init__(self, name):
-        super(CaffeSoftmaxLayer, self).__init__(name, 'Softmax')
-    def write(self, f):
-        f.write(self.get_template().format(""))
-
-class CaffeProtoGenerator:
-    def __init__(self, name):
-        self.name = name
-        self.sections = []
-        self.lnum = 0
-        self.layer = None
-    def add_layer(self, l):
-        self.sections.append( l )
-    def add_input_layer(self, items):
-        self.lnum = 0
-        lname = "data"
-        self.layer = CaffeInputLayer(lname, items['channels'], items['width'], items['height'])
-        self.layer.top.append( lname )
-        self.add_layer( self.layer )
-    def add_convolution_layer(self, items):
-        self.lnum += 1
-        prev_blob = self.layer.top[0]
-        lname = "conv"+str(self.lnum)
-        filters = items['filters']
-        ksize = items['size'] if 'size' in items else None
-        stride = items['stride'] if 'stride' in items else None
-        pad = items['pad'] if 'pad' in items else None
-        bias = not bool(items['batch_normalize']) if 'batch_normalize' in items else True
-        self.layer = CaffeConvolutionLayer( lname, filters, ksize=ksize, stride=stride, pad=pad, bias=bias )
-        self.layer.bottom.append( prev_blob )
-        self.layer.top.append( lname )
-        self.add_layer( self.layer )
-    def add_innerproduct_layer(self, items):
-        self.lnum += 1
-        prev_blob = self.layer.top[0]
-        lname = "fc"+str(self.lnum)
-        num_output = items['output']
-        self.layer = CaffeInnerProductLayer( lname, num_output )
-        self.layer.bottom.append( prev_blob )
-        self.layer.top.append( lname )
-        self.add_layer( self.layer )
-    def add_pooling_layer(self, ltype, items, global_pooling=None):
-        prev_blob = self.layer.top[0]
-        lname = "pool"+str(self.lnum)
-        ksize = items['size'] if 'size' in items else None
-        stride = items['stride'] if 'stride' in items else None
-        pad = items['pad'] if 'pad' in items else None
-        self.layer = CaffePoolingLayer( lname, ltype, ksize=ksize, stride=stride, pad=pad, global_pooling=global_pooling )
-        self.layer.bottom.append( prev_blob )
-        self.layer.top.append( lname )
-        self.add_layer( self.layer )
-    def add_batchnorm_layer(self, items):
-        prev_blob = self.layer.top[0]
-        lname = "bn"+str(self.lnum)
-        self.layer = CaffeBatchNormLayer( lname )
-        self.layer.bottom.append( prev_blob )
-        self.layer.top.append( lname )
-        self.add_layer( self.layer )
-    def add_scale_layer(self, items):
-        prev_blob = self.layer.top[0]
-        lname = "scale"+str(self.lnum)
-        self.layer = CaffeScaleLayer( lname )
-        self.layer.bottom.append( prev_blob )
-        self.layer.top.append( lname )
-        self.add_layer( self.layer )
-    def add_relu_layer(self, items):
-        prev_blob = self.layer.top[0]
-        lname = "relu"+str(self.lnum)
-        self.layer = CaffeReluLayer( lname )
-        self.layer.bottom.append( prev_blob )
-        self.layer.top.append( prev_blob )     # loopback
-        self.add_layer( self.layer )
-    def add_dropout_layer(self, items):
-        prev_blob = self.layer.top[0]
-        lname = "drop"+str(self.lnum)
-        self.layer = CaffeDropoutLayer( lname, items['probability'] )
-        self.layer.bottom.append( prev_blob )
-        self.layer.top.append( prev_blob )     # loopback
-        self.add_layer( self.layer )
-    def add_softmax_layer(self, items):
-        prev_blob = self.layer.top[0]
-        lname = "prob"
-        self.layer = CaffeSoftmaxLayer( lname )
-        self.layer.bottom.append( prev_blob )
-        self.layer.top.append( lname )
-        self.add_layer( self.layer )
-    def finalize(self, name):
-        self.layer.top[0] = name    # replace
-    def write(self, fname):
-        with open(fname, 'w') as f:
-            f.write('name: "{}"'.format(self.name))
-            for sec in self.sections:
-                sec.write(f)
-        logging.info('{} is generated'.format(fname))
-
-###################################################################33
-class uniqdict(OrderedDict):
-    _unique = 0
-    def __setitem__(self, key, val):
-        if isinstance(val, OrderedDict):
-            self._unique += 1
-            key += "_"+str(self._unique)
-        OrderedDict.__setitem__(self, key, val)
-
-def convert(cfgfile, ptxtfile):
-    #
-    parser = ConfigParser(dict_type=uniqdict)
-    parser.read(cfgfile)
-    netname = os.path.basename(cfgfile).split('.')[0]
-    #print netname
-    gen = CaffeProtoGenerator(netname)
-    for section in parser.sections():
-        _section = section.split('_')[0]
-        if _section in ["crop", "cost"]:
+    config = []
+    element = {}
+    section_name = None
+    for line in lines:
+        if not line or line[0] == '#':  # empty or comment
             continue
-        #
-        batchnorm_followed = False
-        relu_followed = False
-        items = dict(parser.items(section))
-        if 'batch_normalize' in items and items['batch_normalize']:
-            batchnorm_followed = True
-        if 'activation' in items and items['activation'] != 'linear':
-            relu_followed = True
-        #
-        if _section == 'net':
-            gen.add_input_layer(items)
-        elif _section == 'convolutional':
-            gen.add_convolution_layer(items)
-            if batchnorm_followed:
-                gen.add_batchnorm_layer(items)
-                gen.add_scale_layer(items)
-            if relu_followed:
-                gen.add_relu_layer(items)
-        elif _section == 'connected':
-            gen.add_innerproduct_layer(items)
-            if relu_followed:
-                gen.add_relu_layer(items)
-        elif _section == 'maxpool':
-            gen.add_pooling_layer('MAX', items)
-        elif _section == 'avgpool':
-            gen.add_pooling_layer('AVE', items, global_pooling=True)
-        elif _section == 'dropout':
-            gen.add_dropout_layer(items)
-        elif _section == 'softmax':
-            gen.add_softmax_layer(items)
+        if line[0] == '[':  # new section
+            if section_name:
+                config.append((section_name, element))
+                element = {}
+            section_name = line[1:].strip(']')
         else:
-            logging.error("{} layer is not supported".format(_section))
-    #gen.finalize('result')
-    gen.write(ptxtfile)
+            key, value = line.split('=')
+            element[key] = value
+    config.append((section_name, element))
+
+    return config
+
+
+## Layer parsing ##
+###################
+
+
+def data_layer(name, params, train=False):
+    """ add a data layer """
+    fields = dict(shape={"dim": [1, int(params["channels"]),
+                                 int(params["width"]), int(params["height"])]})
+    if train:
+        fields.update(data_param=dict(batch_size=int(params["batch"])),
+                      include=dict(phase=caffe.TEST))
+        if "crop_width" in params.keys():
+            if params["crop_width"] != params["crop_height"]:
+                raise ValueError("Rectangular crop not supported.")
+            fields.update(transform_param=dict(
+                mirror=bool(params["flip"]), crop_size=int(params["crop_width"])))
+        layer = cl.DummyData
+    else:
+        layer = cl.Input
+
+    return layer(name=name, **fields)
+
+
+def activation_layer(previous, count, mode="relu"):
+    """ create a non-linear activation layer """
+    if   mode == "relu":
+        return cl.RelU(previous, name="relu{}".format(count), in_place=True)
+    elif mode == "leaky":
+        return cl.ReLU(previous, name="relu{}".format(count),
+                       in_place=True, relu_param=dict(negative_slope=0.1))
+    else:
+        raise ValueError("Activation mode not implemented: {0}".format(mode))
+
+
+def convolutional_layer(previous, name, params, train=False, has_bn=False):
+    """ create a convolutional layer given the parameters and previous layer """
+    fields = dict(num_output=int(params["filters"]),
+                  kernel_size=int(params["size"]))
+    if "stride" in params.keys():
+        fields["stride"] = int(params["stride"])
+    if int(params.get("pad", 0)) == 1:    # use 'same' strategy for convolutions
+        fields["pad"] = fields["kernel_size"]//2
+    if has_bn:
+        fields["bias_term"] = False
+
+    if train:
+        fields.update(weight_filler=dict(type="gaussian", std=0.01),
+                      bias_filler=dict(type="constant", value=0))
+
+    return cl.Convolution(previous, name=name, **fields)
+
+
+def local_layer(previous, name, params, train=False):
+    """ create a locally connected layer given the parameters and previous
+    layer """
+    if 'LocalConvolution' not in caffe.layer_type_list():
+        raise ValueError("Layer not available: LocalConvolution")
+
+    fields = dict(num_output=int(params["filters"]),
+                  kernel_size=int(params["size"]))
+    if "stride" in params.keys():
+        fields["stride"] = int(params["stride"])
+
+    if int(params.get("pad", 0)) == 1:    # use 'same' strategy for convolutions
+        fields["pad"] = fields["kernel_size"]//2
+    if train:
+        fields.update(weight_filler=dict(type="gaussian", std=0.01),
+                      bias_filler=dict(type="constant", value=0))
+
+    return cl.LocalConvolution(previous, name=name, **fields)
+
+
+def batchnorm_layer(previous, name, train=False):
+    """ create a batch normalization layer given the parameters and previous
+    layer """
+    if not train:
+        return cl.BatchNorm(previous, name=name, use_global_stats=True)
+
+    return cl.BatchNorm(previous, name=name, include=dict(phase=caffe.TRAIN),
+                        # suppress SGD on bn params for old Caffe versions
+                        param=[dict(lr_mult=0, decay_mult=0)]*3,
+                        use_global_stats=False)
+
+
+def max_pooling_layer(previous, name, params):
+    """ create a max pooling layer """
+    return cl.Pooling(
+        previous, name=name, pool=cp.Pooling.MAX,
+        kernel_size=int(params["size"]), stride=int(params["stride"]))
+
+
+def global_pooling_layer(previous, name, mode="avg"):
+    """ create a Global Pooling Layer """
+    pool = cp.Pooling.AVE if mode == "avg" else cp.Pooling.MAX
+    return cl.Pooling(previous, name=name, pool=pool, global_pooling=True)
+
+
+def dense_layer(previous, name, params, train=False):
+    """ create a densse layer """
+    fields = dict(num_output=int(params["output"]))
+    if train:
+        fields.update(weight_filler=dict(type="gaussian", std=0.01),
+                      bias_filler=dict(type="constant", value=0))
+    return cl.InnerProduct(previous, name=name, inner_product_param=fields)
+
+
+### layer aggregation ###
+#########################
+
+def add_convolutional_layer(layers, count, params, train=False):
+    """ add layers related to a convolutional block in YOLO the layer list """
+    layer_name = "conv{0}".format(count)
+    has_batch_norm = (params.get("batch_normalize", '0') == '1')
+
+    layers.append(convolutional_layer(layers[-1], layer_name, params,
+                                      train, has_batch_norm))
+    if has_batch_norm:
+        layers.append(batchnorm_layer(layers[-1], "{0}_bn".format(layer_name),
+                                      train))
+        layers.append(cl.Scale(layers[-1], name="{0}_scale".format(layer_name),
+                               scale_param=dict(bias_term=True)))
+    if params["activation"] != "linear":
+        layers.append(activation_layer(layers[-1], count, params["activation"]))
+
+
+def add_dense_layer(layers, count, params, train=False):
+    """ add layers related to a connected block in YOLO to the layer list """
+    layers.append(dense_layer(layers[-1], "fc{0}".format(count), params, train))
+    if params["activation"] != "linear":
+        layers.append(activation_layer(layers[-1], count, params["activation"]))
+
+
+def add_local_layer(layers, count, params, train=False):
+    """ add layers related to a connected block in YOLO to the layer list """
+    layers.append(local_layer(layers[-1], "local{0}".format(count), params, train))
+    if params["activation"] != "linear":
+        layers.append(activation_layer(layers[-1], count, params["activation"]))
+
+
+def convert_configuration(config, train=False, loc_layer=False):
+    """ given a list of YOLO layers as dictionaries, convert them to Caffe """
+    layers = []
+    count = 0
+
+    for section, params in config:
+        if   section == "net":
+            input_params = params
+            layers.append(data_layer("data", input_params, train))
+        elif section == "crop":
+            if train:    # update data layer with crop parameters
+                input_params.update(params)
+                layers[-1] = data_layer("data", input_params, train)
+        elif section == "convolutional":
+            count += 1
+            add_convolutional_layer(layers, count, params, train)
+        elif section == "maxpool":
+            layers.append(max_pooling_layer(layers[-1], "pool{0}".format(count),
+                                            params))
+        elif section == "avgpool":
+            layers.append(global_pooling_layer(layers[-1], "pool{0}".format(count)))
+        elif section == "softmax":
+            layers.append(cl.Softmax(layers[-1], name="softmax{0}".format(count)))
+        elif section == "connected":
+            count += 1
+            add_dense_layer(layers, count, params, train)
+        elif section == "dropout":
+            if train:
+                layers.append(cl.Dropout(layers[-1], name="drop{0}".format(count),
+                                         dropout_ratio=float(params["probability"])))
+        elif section == "local" and loc_layer:
+            count += 1
+            add_local_layer(layers, count, params, train)
+        else:
+            print("WARNING: {0} layer not recognized".format(section))
+
+    model = caffe.NetSpec()
+    for layer in layers:
+        setattr(model, layer.fn.params["name"], layer)
+    model.result = layers[-1]       
+
+    return model
+
+
+def adjust_params(model, model_filename):
+    """ Set layer parameters that depends on blob attributes.
+    Blobs are available only in Net() objects, but NetSpec() or NetParameters()
+    can't be used to create a Net(). So we write a first prototxt, we reload it,
+    fix the missing parameters and save it again.
+    """
+    with open(model_filename, 'w') as fproto:
+        fproto.write("{0}".format(model.to_proto()))
+
+    net = caffe.Net(model_filename, caffe.TEST)
+    for name, layer in model.tops.iteritems():
+        if name.startswith("local"):
+            width, height = net.blobs[name].data.shape[-2:]
+            if width != height:
+                raise ValueError(" Only square inputs supported for local layers.")
+            layer.fn.params.update(
+                local_region_number=width, local_region_ratio=1.0/width,
+                local_region_step=1)
+
+    return model
+
 
 def main():
-    parser = argparse.ArgumentParser(description='Convert YOLO cfg to Caffe prototxt')
-    parser.add_argument('cfg', type=str, help='YOLO cfg')
-    parser.add_argument('prototxt', type=str, help='Caffe prototxt')
+    """ script entry point """
+    parser = argparse.ArgumentParser(description='Convert a YOLO cfg file.')
+    parser.add_argument('model', type=str, help='YOLO cfg model')
+    parser.add_argument('output', type=str, help='output prototxt')
+    parser.add_argument('--loclayer', action='store_true',
+                        help='use locally connected layer')
+    parser.add_argument('--train', action='store_true',
+                        help='generate train_val prototxt')
     args = parser.parse_args()
 
-    convert(args.cfg, args.prototxt)
+    config = load_configuration(args.model)
+    model = convert_configuration(config, args.train, args.loclayer)
 
-if __name__ == "__main__":
+    suffix = "train_val" if args.train else "deploy"
+    model_filename = "{}_{}.prototxt".format(args.output, suffix)
+
+    if args.loclayer:
+        model = adjust_params(model, model_filename)
+
+    with open(model_filename, 'w') as fproto:
+        fproto.write("{0}".format(model.to_proto()))
+
+
+if __name__ == '__main__':
     main()
-
-# vim:sw=4:ts=4:et
