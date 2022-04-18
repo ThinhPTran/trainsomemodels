@@ -10,7 +10,7 @@ ret, frame = cap.read()
 # Setup initial location of window
 # r, h, c, w - region of image
 #              simply hardcorded the value
-x, y, w, h = 450, 200, 20, 20
+x, y, w, h = 230, 130, 20, 20
 
 track_window = (x,y,w,h)
 
